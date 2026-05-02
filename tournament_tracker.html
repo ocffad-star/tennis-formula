@@ -930,26 +930,25 @@ function deleteMatch(tid, round, mid) {
   showToast('Match removed', 'success');
 }
 
-// ── RAPIDAPI FETCH ────────────────────────────────────────────────────────────
-// API field names per documentation:
-// tournaments: tournament_key, tournament_name, event_type_key, event_type_type
-// matches: event_key, event_date, event_first_player, first_player_key,
-//          event_second_player, second_player_key, tournament_round,
-//          tournament_name, tournament_key, event_status
+// ── RAPIDAPI FETCH — v2 API ───────────────────────────────────────────────────
+// Base: /tennis/v2/{atp|wta}/fixtures
+// Round IDs: 7=R128(R1), 6=R64(R1), 5=R32(R2), 4=R16(R3), 3=QF, 2=SF, 1=F
+// Fields: player1.name, player2.name, tournament.name, tournament.court.name,
+//         round.id, round.name, tournamentId, id
+
+const BASE = `https://${RAPIDAPI_HOST}/tennis/v2`;
+const HEADERS = {
+  'X-RapidAPI-Key': RAPIDAPI_KEY,
+  'X-RapidAPI-Host': RAPIDAPI_HOST
+};
 
 async function apiFetch(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 12000);
   try {
-    const res = await fetch(url, {
-      headers: {
-        'X-RapidAPI-Key': RAPIDAPI_KEY,
-        'X-RapidAPI-Host': RAPIDAPI_HOST
-      },
-      signal: ctrl.signal
-    });
+    const res = await fetch(url, { headers: HEADERS, signal: ctrl.signal });
     clearTimeout(timer);
-    if (!res.ok) throw new Error(`API error ${res.status}`);
+    if (!res.ok) throw new Error(`API ${res.status}`);
     return await res.json();
   } catch(e) {
     clearTimeout(timer);
@@ -957,102 +956,131 @@ async function apiFetch(url) {
   }
 }
 
-function detectTourFromType(typeStr) {
-  const s = (typeStr || '').toLowerCase();
-  if (s.includes('wta') || s.includes('women')) return 'WTA';
-  return 'ATP';
+function roundIdToCode(roundId) {
+  // 1=Final, 2=SF, 3=QF, 4=R16, 5=R32, 6=R64, 7=R128
+  if (roundId === 7 || roundId === 6) return 'R1';
+  if (roundId === 5) return 'R2';
+  if (roundId === 4) return 'R3';
+  if (roundId === 3) return 'QF';
+  if (roundId === 2) return 'SF';
+  if (roundId === 1) return 'F';
+  return null;
 }
 
-function detectSurfaceFromName(name) {
-  const s = (name || '').toLowerCase();
-  if (s.includes('clay') || s.includes('roland') || s.includes('monte') || s.includes('madrid') || s.includes('rome') || s.includes('barcelona')) return 'clay';
-  if (s.includes('grass') || s.includes('wimbledon') || s.includes('halle') || s.includes("queen's") || s.includes('eastbourne')) return 'grass';
+function surfaceFromCourt(courtName) {
+  const s = (courtName || '').toLowerCase();
+  if (s.includes('clay')) return 'clay';
+  if (s.includes('grass')) return 'grass';
   return 'hard';
+}
+
+function extractFixtures(data) {
+  // API returns array directly for today, or { data: [...] } for date range
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.data)) return data.data;
+  return [];
 }
 
 async function fetchTournaments() {
   const spinner = document.getElementById('refreshSpinner');
   spinner.style.display = 'inline-block';
   const sub = document.getElementById('pageSub');
-  sub.textContent = 'Fetching tournaments from API…';
+  sub.textContent = 'Fetching today\'s fixtures…';
 
   try {
-    // Use the matches endpoint for today to get active tournaments
-    const today = new Date().toISOString().slice(0,10);
-    const data = await apiFetch(`https://${RAPIDAPI_HOST}/matches?type=1&date_start=${today}&date_stop=${today}`);
+    // Fetch ATP and WTA fixtures for today in parallel
+    const include = 'include=round,tournament,tournament.court,tournament.rank';
+    const filter = 'filter=PlayerGroup:singles';
 
-    const matches = data.result || [];
+    const [atpData, wtaData] = await Promise.all([
+      apiFetch(`${BASE}/atp/fixtures?${include}&${filter}&pageSize=100`),
+      apiFetch(`${BASE}/wta/fixtures?${include}&${filter}&pageSize=100`)
+    ]);
 
-    // Extract unique tournaments from today's matches
-    const seen = new Map();
-    matches.forEach(m => {
-      const key = m.tournament_key || m.tournament_name;
-      if (!key || seen.has(key)) return;
-      seen.set(key, m);
+    const atpFixtures = extractFixtures(atpData).map(f => ({...f, _tour: 'ATP'}));
+    const wtaFixtures = extractFixtures(wtaData).map(f => ({...f, _tour: 'WTA'}));
+    const allFixtures = [...atpFixtures, ...wtaFixtures];
+
+    // Group by tournament
+    const tourMap = new Map();
+    allFixtures.forEach(f => {
+      const tid = f.tournamentId || f.tournament?.id;
+      if (!tid) return;
+      if (!tourMap.has(tid)) tourMap.set(tid, { fixtures: [], tour: f._tour, info: f.tournament });
+      tourMap.get(tid).fixtures.push(f);
     });
 
     let added = 0;
-    seen.forEach((m, key) => {
-      const name = m.tournament_name || 'Unknown Tournament';
-      const exists = tournaments.find(t => t.name.toLowerCase() === name.toLowerCase());
-      if (exists) return;
+    tourMap.forEach((val, tid) => {
+      const info = val.info || {};
+      const name = info.name || `Tournament ${tid}`;
+      const exists = tournaments.find(t => t.apiId == tid);
+      if (exists) {
+        // Update rounds on existing tournament
+        mergeFixturesToTournament(exists, val.fixtures);
+        return;
+      }
 
-      const typeStr = m.event_type_type || '';
-      const tour = detectTourFromType(typeStr);
-      const surface = detectSurfaceFromName(name);
-
-      tournaments.unshift({
-        id: `api-${m.tournament_key || Date.now()}`,
+      const surface = surfaceFromCourt(info.court?.name);
+      const newT = {
+        id: `api-${tid}`,
         name,
-        tour,
+        tour: val.tour,
         surface,
-        location: '',
-        category: typeStr,
+        location: info.countryAcr || '',
+        category: info.rank?.name || '',
         status: 'live',
         manual: false,
-        apiId: m.tournament_key,
+        apiId: tid,
         rounds: [],
         added: new Date().toISOString()
-      });
+      };
+      mergeFixturesToTournament(newT, val.fixtures);
+      tournaments.unshift(newT);
       added++;
     });
 
-    // If no matches today, try fetching the tournament list directly
-    if (added === 0 && matches.length === 0) {
-      const tData = await apiFetch(`https://${RAPIDAPI_HOST}/tournaments?type=1`);
-      const list = tData.result || [];
-      list.slice(0, 50).forEach(item => {
-        const name = item.tournament_name || 'Unknown';
-        const exists = tournaments.find(t => t.name.toLowerCase() === name.toLowerCase());
-        if (exists) return;
-        const typeStr = item.event_type_type || '';
-        const tour = detectTourFromType(typeStr);
-        tournaments.unshift({
-          id: `api-${item.tournament_key || Date.now()}`,
-          name,
-          tour,
-          surface: detectSurfaceFromName(name),
-          location: '',
-          category: typeStr,
-          status: 'upcoming',
-          manual: false,
-          apiId: item.tournament_key,
-          rounds: [],
-          added: new Date().toISOString()
-        });
-        added++;
-      });
-    }
-
     save();
-    sub.textContent = `${added} tournaments loaded · ${matches.length} matches found today`;
-    showToast(`${added} tournaments loaded ✓`, 'success');
+    sub.textContent = `${added} tournaments loaded · ${allFixtures.length} fixtures today`;
+    showToast(`${added} tournaments, ${allFixtures.length} fixtures ✓`, 'success');
   } catch (err) {
     sub.textContent = 'API fetch failed — add manually or check key';
     showToast(`Fetch failed: ${err.message}`, 'error');
   } finally {
     spinner.style.display = 'none';
   }
+}
+
+function mergeFixturesToTournament(t, fixtures) {
+  fixtures.forEach(f => {
+    const roundId = f.roundId || f.round?.id;
+    const round = roundIdToCode(roundId);
+    if (!round) return;
+
+    let roundObj = t.rounds.find(r => r.round === round);
+    if (!roundObj) {
+      roundObj = { round, matches: [] };
+      t.rounds.push(roundObj);
+    }
+
+    const mid = `api-${f.id}`;
+    if (roundObj.matches.find(x => x.id === mid)) return;
+
+    roundObj.matches.push({
+      id: mid,
+      p1: {
+        name: f.player1?.name || 'Player 1',
+        rank: null,
+        surf: 65, formWins: 7, dataSource: 'Estimated'
+      },
+      p2: {
+        name: f.player2?.name || 'Player 2',
+        rank: null,
+        surf: 65, formWins: 7, dataSource: 'Estimated'
+      }
+    });
+  });
+  t.rounds.sort((a,b) => roundOrder(a.round) - roundOrder(b.round));
 }
 
 async function fetchTournamentMatches(tid) {
@@ -1063,34 +1091,32 @@ async function fetchTournamentMatches(tid) {
   if (spin) spin.style.display = 'inline-block';
 
   try {
-    let matches = [];
+    const include = 'include=round,tournament,tournament.court';
+    const filter = 'filter=PlayerGroup:singles';
+    const tour = (t.tour || 'ATP').toLowerCase();
+
+    let fixtures = [];
 
     if (t.apiId) {
-      // Try fetching by tournament key
-      const data = await apiFetch(`https://${RAPIDAPI_HOST}/matches?type=1&tournament_key=${t.apiId}`);
-      matches = data.result || [];
+      const data = await apiFetch(`${BASE}/${tour}/fixtures/tournament/${t.apiId}?${include}&${filter}&pageSize=100`);
+      fixtures = extractFixtures(data);
     }
 
-    // Fallback: fetch today's matches and filter by tournament name
-    if (matches.length === 0) {
-      const today = new Date().toISOString().slice(0,10);
-      const data = await apiFetch(`https://${RAPIDAPI_HOST}/matches?type=1&date_start=${today}&date_stop=${today}`);
-      const all = data.result || [];
-      matches = all.filter(m =>
-        (m.tournament_name || '').toLowerCase() === t.name.toLowerCase() ||
-        (m.tournament_key && m.tournament_key == t.apiId)
+    // If empty, fall back to today's fixtures filtered by tournament name
+    if (fixtures.length === 0) {
+      const data = await apiFetch(`${BASE}/${tour}/fixtures?${include}&${filter}&pageSize=100`);
+      const all = extractFixtures(data);
+      fixtures = all.filter(f =>
+        (f.tournament?.name || '').toLowerCase() === t.name.toLowerCase() ||
+        f.tournamentId == t.apiId
       );
-      // If still nothing, just use all of today's matches for this tournament
-      if (matches.length === 0 && t.status === 'live') matches = all;
     }
 
     let added = 0;
-    matches.forEach(m => {
-      // API uses tournament_round like "Roland Garros 2022 - 1/16-finals"
-      // or "Round 1", "1/8-finals" etc
-      const roundRaw = m.tournament_round || m.round || '';
-      const round = normaliseRound(roundRaw);
-      if (!['R1','R2','R3','QF','SF','F'].includes(round)) return;
+    fixtures.forEach(f => {
+      const roundId = f.roundId || f.round?.id;
+      const round = roundIdToCode(roundId);
+      if (!round) return;
 
       let roundObj = t.rounds.find(r => r.round === round);
       if (!roundObj) {
@@ -1098,28 +1124,20 @@ async function fetchTournamentMatches(tid) {
         t.rounds.push(roundObj);
       }
 
-      const mid = `api-${m.event_key || Date.now()}`;
+      const mid = `api-${f.id}`;
       if (roundObj.matches.find(x => x.id === mid)) return;
 
       roundObj.matches.push({
         id: mid,
-        p1: {
-          name: m.event_first_player || 'Player 1',
-          rank: null,
-          surf: 65, formWins: 7, dataSource: 'Estimated'
-        },
-        p2: {
-          name: m.event_second_player || 'Player 2',
-          rank: null,
-          surf: 65, formWins: 7, dataSource: 'Estimated'
-        }
+        p1: { name: f.player1?.name || 'Player 1', rank: null, surf: 65, formWins: 7, dataSource: 'Estimated' },
+        p2: { name: f.player2?.name || 'Player 2', rank: null, surf: 65, formWins: 7, dataSource: 'Estimated' }
       });
       added++;
     });
 
     t.rounds.sort((a,b) => roundOrder(a.round) - roundOrder(b.round));
     save();
-    showToast(added > 0 ? `${added} matches loaded ✓` : 'No R1/R2 matches found — try editing dates or add manually', added > 0 ? 'success' : 'info');
+    showToast(added > 0 ? `${added} matches loaded ✓` : 'No matches found — try Add Manual', added > 0 ? 'success' : 'info');
   } catch (err) {
     showToast(`Match fetch failed: ${err.message}`, 'error');
   } finally {
@@ -1127,20 +1145,8 @@ async function fetchTournamentMatches(tid) {
   }
 }
 
-function normaliseRound(r) {
-  const s = (r || '').toLowerCase().replace(/\s/g,'');
-  // API returns strings like "Roland Garros 2026 - 1/16-finals" or "1/8-finals"
-  if (s.includes('1/16') || s.includes('firstround') || s.includes('round1') || s === 'r1' || s.includes('128') || s.includes('64')) return 'R1';
-  if (s.includes('1/8')  || s.includes('secondround') || s.includes('round2') || s === 'r2' || s.includes('32'))  return 'R2';
-  if (s.includes('1/4final') || s.includes('quarterfinal') || s.includes('qf')) return 'QF';
-  if (s.includes('1/2final') || s.includes('semifinal') || s.includes('sf'))   return 'SF';
-  if (s === 'final' || s === 'f' || s.includes('thefinal')) return 'F';
-  if (s.includes('round3') || s === 'r3' || s.includes('1/16')) return 'R3';
-  // Catch-all for fractions: 1/64 = R1, 1/32 = R2, 1/16 = R3
-  if (s.includes('1/64')) return 'R1';
-  if (s.includes('1/32')) return 'R2';
-  return null; // unknown rounds get filtered out
-}
+function normaliseRound(r) { return r; } // legacy stub — kept for safety
+
 
 // ── MODAL HELPERS ─────────────────────────────────────────────────────────────
 function openModal(id) { document.getElementById(id).classList.add('open'); }
